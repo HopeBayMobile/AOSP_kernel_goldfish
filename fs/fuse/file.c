@@ -1522,21 +1522,22 @@ static void fuse_writepage_finish(struct fuse_conn *fc, struct fuse_req *req)
 }
 
 /* Called under fc->lock, may release and reacquire it */
-static void fuse_send_writepage(struct fuse_conn *fc, struct fuse_req *req)
+static void fuse_send_writepage(struct fuse_conn *fc, struct fuse_req *req,
+                                loff_t size)
 __releases(fc->lock)
 __acquires(fc->lock)
 {
 	struct fuse_inode *fi = get_fuse_inode(req->inode);
-	loff_t size = i_size_read(req->inode);
 	struct fuse_write_in *inarg = &req->misc.write.in;
+	__u64 data_size = req->num_pages * PAGE_CACHE_SIZE;
 
 	if (!fc->connected)
 		goto out_free;
 
-	if (inarg->offset + PAGE_CACHE_SIZE <= size) {
-		inarg->size = PAGE_CACHE_SIZE;
+	if (inarg->offset + data_size <= size) {
+		inarg->size = data_size;
 	} else if (inarg->offset < size) {
-		inarg->size = size & (PAGE_CACHE_SIZE - 1);
+		inarg->size = size - inarg->offset;
 	} else {
 		/* Got truncated off completely */
 		goto out_free;
@@ -1567,12 +1568,13 @@ __acquires(fc->lock)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	size_t crop = i_size_read(inode);
 	struct fuse_req *req;
 
 	while (fi->writectr >= 0 && !list_empty(&fi->queued_writes)) {
 		req = list_entry(fi->queued_writes.next, struct fuse_req, list);
 		list_del_init(&req->list);
-		fuse_send_writepage(fc, req);
+		fuse_send_writepage(fc, req, crop);
 	}
 }
 
@@ -1583,6 +1585,40 @@ static void fuse_writepage_end(struct fuse_conn *fc, struct fuse_req *req)
 
 	mapping_set_error(inode->i_mapping, req->out.h.error);
 	spin_lock(&fc->lock);
+	while (req->misc.write.next) {
+		struct fuse_conn *fc = get_fuse_conn(inode);
+		struct fuse_write_in *inarg = &req->misc.write.in;
+		struct fuse_req *next = req->misc.write.next;
+		req->misc.write.next = next->misc.write.next;
+		next->misc.write.next = NULL;
+		next->ff = fuse_file_get(req->ff);
+		list_add(&next->writepages_entry, &fi->writepages);
+
+		/*
+		 * Skip fuse_flush_writepages() to make it easy to crop requests
+		 * based on primary request size.
+		 *
+		 * 1st case (trivial): there are no concurrent activities using
+		 * fuse_set/release_nowrite.  Then we're on safe side because
+		 * fuse_flush_writepages() would call fuse_send_writepage()
+		 * anyway.
+		 *
+		 * 2nd case: someone called fuse_set_nowrite and it is waiting
+		 * now for completion of all in-flight requests.  This happens
+		 * rarely and no more than once per page, so this should be
+		 * okay.
+		 *
+		 * 3rd case: someone (e.g. fuse_do_setattr()) is in the middle
+		 * of fuse_set_nowrite..fuse_release_nowrite section.  The fact
+		 * that fuse_set_nowrite returned implies that all in-flight
+		 * requests were completed along with all of their secondary
+		 * requests.  Further primary requests are blocked by negative
+		 * writectr.  Hence there cannot be any in-flight requests and
+		 * no invocations of fuse_writepage_end() while we're in
+		 * fuse_set_nowrite..fuse_release_nowrite section.
+		 */
+		fuse_send_writepage(fc, next, inarg->offset + inarg->size);
+	}
 	fi->writectr--;
 	fuse_writepage_finish(fc, req);
 	spin_unlock(&fc->lock);
@@ -1644,6 +1680,7 @@ static int fuse_writepage_locked(struct page *page)
 
 	copy_highpage(tmp_page, page);
 	req->misc.write.in.write_flags |= FUSE_WRITE_CACHE;
+	req->misc.write.next = NULL;
 	req->in.argpages = 1;
 	req->num_pages = 1;
 	req->pages[0] = tmp_page;
